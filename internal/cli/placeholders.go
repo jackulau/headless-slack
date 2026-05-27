@@ -99,12 +99,4 @@ func tuiCmd() *cobra.Command {
 
 var readLast int
 
-func runLogin() error                { return errNotYet }
-func runChannels() error             { return errNotYet }
-func runRead(string, int) error      { return errNotYet }
-func runSend(string, []string) error { return errNotYet }
-func runDM(string, []string) error   { return errNotYet }
-func runWatch(string) error          { return errNotYet }
-func runUsers() error                { return errNotYet }
-func runSearch([]string) error       { return errNotYet }
-func runTUI() error                  { return errNotYet }
+func runTUI() error { return errNotYet } // implemented in D8
