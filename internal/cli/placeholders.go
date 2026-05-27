@@ -1,9 +1,12 @@
 package cli
 
 import (
+	"context"
 	"errors"
 
 	"github.com/spf13/cobra"
+
+	"github.com/jacklau/headless-slack/internal/tui"
 )
 
 var errNotYet = errors.New("command not yet implemented — see deliverable in GOAL.md")
@@ -99,4 +102,12 @@ func tuiCmd() *cobra.Command {
 
 var readLast int
 
-func runTUI() error { return errNotYet } // implemented in D8
+func runTUI() error {
+	ctx := context.Background()
+	s, err := open(ctx)
+	if err != nil {
+		return err
+	}
+	defer s.close()
+	return tui.Run(ctx, s.Client, s.Store)
+}
