@@ -1,5 +1,5 @@
 .claude-workspace/
-slk
+/slk
 *.db
 *.sqlite
 .DS_Store
