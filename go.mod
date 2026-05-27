@@ -3,6 +3,7 @@ module github.com/jacklau/headless-slack
 go 1.25.0
 
 require (
+	github.com/gorilla/websocket v1.5.3
 	github.com/mattn/go-sqlite3 v1.14.44
 	github.com/refraction-networking/utls v1.8.2
 	github.com/spf13/cobra v1.10.2
