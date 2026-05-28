@@ -28,6 +28,10 @@ history, "slk send <chan> <msg>" posts, and "slk watch" streams
 events. Run "slk" with no args to launch the TUI.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// No subcommand → launch the TUI.
+			return runTUI()
+		},
 	}
 
 	defaultCfg, _ := defaultConfigDir()

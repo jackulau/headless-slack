@@ -13,58 +13,95 @@ import (
 
 func runLogin() error {
 	ctx := context.Background()
-	reader := bufio.NewReader(os.Stdin)
+	_ = ctx
 
-	teamInput := strings.TrimSpace(team)
-	if teamInput == "" {
-		fmt.Print("Slack workspace URL or subdomain (e.g. myco or https://myco.slack.com): ")
-		s, err := reader.ReadString('\n')
-		if err != nil {
-			return err
-		}
-		teamInput = strings.TrimSpace(s)
-	}
-	teamSub, err := auth.TeamFromURL(teamInput)
-	if err != nil {
-		return err
+	teamHint := strings.TrimSpace(team)
+	if teamHint == "" {
+		teamHint = strings.TrimSpace(os.Getenv("SLACK_TEAM"))
 	}
 
-	// xoxd — try Chrome first, fall back to env, then prompt.
 	xoxd := strings.TrimSpace(os.Getenv("SLACK_XOXD"))
 	if xoxd == "" {
-		fmt.Fprintln(os.Stderr, "Reading 'd' cookie from Chrome (close Chrome if you see a lock error)...")
+		fmt.Fprintln(os.Stderr, "→ Reading Slack session cookie from Chrome...")
 		got, err := auth.ExtractXOXDFromChrome()
-		if err == nil {
-			xoxd = got
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "  Chrome extraction failed:", err)
+			fmt.Fprintln(os.Stderr, "  Falling back to manual paste.")
+			xoxd = promptLine("  Paste xoxd cookie (begins with xoxd-): ")
 		} else {
-			fmt.Fprintln(os.Stderr, "Chrome extraction failed:", err)
-			fmt.Print("Paste xoxd cookie value (begins with xoxd-): ")
-			s, _ := reader.ReadString('\n')
-			xoxd = strings.TrimSpace(s)
+			xoxd = got
+			fmt.Fprintln(os.Stderr, "  ✓ Got xoxd")
 		}
 	}
 	if !strings.HasPrefix(xoxd, "xoxd-") {
 		return errors.New("xoxd not in expected format")
 	}
 
-	// xoxc — fetch boot HTML using xoxd cookie.
-	fmt.Fprintln(os.Stderr, "Fetching workspace bootstrap for xoxc token...")
-	xoxc, err := auth.ExtractXOXC(teamSub, xoxd)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Boot fetch failed:", err)
-		fmt.Print("Paste xoxc token (begins with xoxc-): ")
-		s, _ := reader.ReadString('\n')
-		xoxc = strings.TrimSpace(s)
+	// Build candidate workspace list.
+	var teams []string
+	if teamHint != "" {
+		sub, err := auth.TeamFromURL(teamHint)
+		if err == nil {
+			teams = []string{sub}
+		}
 	}
-	if !strings.HasPrefix(xoxc, "xoxc-") {
-		return errors.New("xoxc not in expected format")
+	if len(teams) == 0 {
+		fmt.Fprintln(os.Stderr, "→ Detecting workspaces from Chrome cookies...")
+		detected, err := auth.ScanSlackTeamsFromChrome()
+		if err == nil && len(detected) > 0 {
+			teams = detected
+			fmt.Fprintf(os.Stderr, "  ✓ Found %d: %s\n", len(detected), strings.Join(detected, ", "))
+		}
+	}
+	if len(teams) == 0 {
+		teamInput := promptLine("  Workspace URL/subdomain (e.g. myco): ")
+		sub, err := auth.TeamFromURL(teamInput)
+		if err != nil {
+			return err
+		}
+		teams = []string{sub}
 	}
 
-	tok := auth.Tokens{Team: teamSub, XOXC: xoxc, XOXD: xoxd}
-	if err := auth.Save(tok); err != nil {
-		return err
+	// Fetch xoxc per team. Skip teams that fail (session not bound there).
+	saved, failed := 0, 0
+	for _, t := range teams {
+		fmt.Fprintf(os.Stderr, "→ %s.slack.com ... ", t)
+		xoxc, err := auth.ExtractXOXC(t, xoxd)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "skip ("+err.Error()+")")
+			failed++
+			continue
+		}
+		if !strings.HasPrefix(xoxc, "xoxc-") {
+			fmt.Fprintln(os.Stderr, "skip (token format)")
+			failed++
+			continue
+		}
+		if err := auth.Save(auth.Tokens{Team: t, XOXC: xoxc, XOXD: xoxd}); err != nil {
+			fmt.Fprintln(os.Stderr, "save failed:", err)
+			failed++
+			continue
+		}
+		fmt.Fprintln(os.Stderr, "✓ saved")
+		saved++
 	}
-	fmt.Fprintf(os.Stderr, "Saved tokens for team %q to OS keychain.\n", teamSub)
-	_ = ctx
+
+	if saved == 0 {
+		return fmt.Errorf("no workspaces enrolled (%d failed)", failed)
+	}
+	fmt.Fprintf(os.Stderr, "\nSaved %d workspace(s) to keychain.\n", saved)
+	if saved == 1 {
+		fmt.Fprintf(os.Stderr, "Try:  slk --team %s channels\n", teams[0])
+		fmt.Fprintf(os.Stderr, "Or:   export SLACK_TEAM=%s\n", teams[0])
+	} else {
+		fmt.Fprintln(os.Stderr, "Run with --team <subdomain> or set SLACK_TEAM to choose.")
+	}
 	return nil
+}
+
+func promptLine(prompt string) string {
+	fmt.Fprint(os.Stderr, prompt)
+	r := bufio.NewReader(os.Stdin)
+	s, _ := r.ReadString('\n')
+	return strings.TrimSpace(s)
 }

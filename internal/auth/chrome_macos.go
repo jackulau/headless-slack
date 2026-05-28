@@ -5,18 +5,19 @@ package auth
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/sha1"
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
-	"crypto/sha1"
-	"golang.org/x/crypto/pbkdf2"
-
 	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/crypto/pbkdf2"
 )
 
 // chromeCookieDB returns the path to Chrome's Cookies SQLite file for the
@@ -102,26 +103,47 @@ func pkcs7Unpad(b []byte) ([]byte, error) {
 	return b[:len(b)-n], nil
 }
 
-// ExtractXOXDFromChrome reads Chrome's cookie DB and decrypts the "d" cookie
-// on *.slack.com. Chrome must be closed (it holds an exclusive lock).
-func ExtractXOXDFromChrome() (string, error) {
+// openChromeDB copies Chrome's cookie DB (plus its WAL/SHM siblings if
+// present) to a temp dir and opens it read-only. Copying the WAL is what lets
+// us read while Chrome is open — without it the main file lags behind.
+func openChromeDB() (*sql.DB, func(), error) {
 	dbPath, err := chromeCookieDB()
 	if err != nil {
-		return "", err
+		return nil, nil, err
 	}
-	// Copy DB to a temp file so we don't fight Chrome for the lock if it's
-	// running with the WAL still active.
-	tmp, err := copyFile(dbPath)
+	tmpDir, err := os.MkdirTemp("", "slk-cookies-*")
 	if err != nil {
-		return "", err
+		return nil, nil, err
 	}
-	defer os.Remove(tmp)
+	tmp := filepath.Join(tmpDir, "Cookies")
+	cleanup := func() { _ = os.RemoveAll(tmpDir) }
 
-	db, err := sql.Open("sqlite3", tmp+"?_busy_timeout=2000&mode=ro")
+	if err := copyFileTo(dbPath, tmp); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		src := dbPath + suffix
+		if _, err := os.Stat(src); err == nil {
+			_ = copyFileTo(src, tmp+suffix)
+		}
+	}
+	db, err := sql.Open("sqlite3", tmp+"?_busy_timeout=2000&mode=ro&immutable=1")
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	return db, func() { _ = db.Close(); cleanup() }, nil
+}
+
+// ExtractXOXDFromChrome reads Chrome's cookie DB and decrypts the "d" cookie
+// on *.slack.com. Tries with Chrome open by copying DB + WAL together.
+func ExtractXOXDFromChrome() (string, error) {
+	db, cleanup, err := openChromeDB()
 	if err != nil {
 		return "", err
 	}
-	defer db.Close()
+	defer cleanup()
 
 	row := db.QueryRow(`
 		SELECT encrypted_value FROM cookies
@@ -150,28 +172,63 @@ func ExtractXOXDFromChrome() (string, error) {
 	return s, nil
 }
 
-func copyFile(src string) (string, error) {
+// ScanSlackTeamsFromChrome returns the set of workspace subdomains the user
+// has visited (one entry per distinct <team>.slack.com host_key in cookies).
+// Reserved hostnames (app/api/files/edgeapi/etc.) are filtered out.
+func ScanSlackTeamsFromChrome() ([]string, error) {
+	db, cleanup, err := openChromeDB()
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
+	rows, err := db.Query(`SELECT DISTINCT host_key FROM cookies WHERE host_key LIKE '%.slack.com'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	seen := map[string]struct{}{}
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			continue
+		}
+		h = strings.TrimPrefix(h, ".")
+		if !strings.HasSuffix(h, ".slack.com") {
+			continue
+		}
+		sub := strings.TrimSuffix(h, ".slack.com")
+		if strings.Contains(sub, ".") {
+			continue // multi-level (e.g. edge-cache.slack.com)
+		}
+		switch sub {
+		case "app", "api", "www", "files", "edgeapi", "downloads",
+			"slack-files", "slack-edge", "slack-imgs", "a", "ca", "wss-primary",
+			"wss-backup", "wss-mobile", "status":
+			continue
+		}
+		seen[sub] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for s := range seen {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func copyFileTo(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer in.Close()
-	tmp, err := os.CreateTemp("", "slk-cookies-*.sqlite")
+	out, err := os.Create(dst)
 	if err != nil {
-		return "", err
+		return err
 	}
-	defer tmp.Close()
-	buf := make([]byte, 1<<16)
-	for {
-		n, err := in.Read(buf)
-		if n > 0 {
-			if _, werr := tmp.Write(buf[:n]); werr != nil {
-				return "", werr
-			}
-		}
-		if err != nil {
-			break
-		}
-	}
-	return tmp.Name(), nil
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	return err
 }
