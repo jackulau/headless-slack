@@ -46,13 +46,22 @@ func chromeCookieDB() (string, error) {
 // encrypts each cookie value.
 //
 // Prompts the user via the system keychain dialog on first call per session.
-func chromeSafeStoragePassword(service string) ([]byte, error) {
-	if service == "" {
-		service = "Chrome"
+// account selects the browser ("Chrome", "Chromium", "Brave", etc.).
+func chromeSafeStoragePassword(account string) ([]byte, error) {
+	if account == "" {
+		account = "Chrome"
 	}
-	out, err := exec.Command("security", "find-generic-password", "-wa", service).Output()
-	if err != nil {
-		return nil, fmt.Errorf("read %q safe storage password: %w (you may need to approve the keychain dialog)", service, err)
+	service := account + " Safe Storage"
+	// Service-scoped lookup is precise (there may be multiple keychain entries
+	// with account "Chrome").
+	out, err := exec.Command("security", "find-generic-password", "-s", service, "-a", account, "-w").Output()
+	if err == nil {
+		return []byte(strings.TrimSpace(string(out))), nil
+	}
+	// Fallback to less-specific account-only lookup for older Chrome versions.
+	out, err2 := exec.Command("security", "find-generic-password", "-a", account, "-w").Output()
+	if err2 != nil {
+		return nil, fmt.Errorf("read %q from Keychain: %w (you may need to approve the keychain dialog)", service, err)
 	}
 	return []byte(strings.TrimSpace(string(out))), nil
 }
@@ -138,6 +147,10 @@ func openChromeDB() (*sql.DB, func(), error) {
 
 // ExtractXOXDFromChrome reads Chrome's cookie DB and decrypts the "d" cookie
 // on *.slack.com. Tries with Chrome open by copying DB + WAL together.
+//
+// Slack has multiple cookies named "d" across hosts (apex `.slack.com` is the
+// xoxd session; per-workspace `myco.slack.com` may have its own metadata `d`).
+// We try each, decrypt, and return the first that looks like an xoxd token.
 func ExtractXOXDFromChrome() (string, error) {
 	db, cleanup, err := openChromeDB()
 	if err != nil {
@@ -145,31 +158,66 @@ func ExtractXOXDFromChrome() (string, error) {
 	}
 	defer cleanup()
 
-	row := db.QueryRow(`
-		SELECT encrypted_value FROM cookies
+	rows, err := db.Query(`
+		SELECT host_key, encrypted_value FROM cookies
 		WHERE name = 'd'
-		  AND host_key LIKE '%.slack.com'
-		ORDER BY length(encrypted_value) DESC
-		LIMIT 1`)
-	var enc []byte
-	if err := row.Scan(&enc); err != nil {
-		return "", fmt.Errorf("no 'd' cookie for *.slack.com in Chrome DB (sign into Slack in Chrome first): %w", err)
+		  AND (host_key = '.slack.com' OR host_key LIKE '%.slack.com')
+		ORDER BY (host_key = '.slack.com') DESC, length(encrypted_value) ASC`)
+	if err != nil {
+		return "", err
 	}
+	defer rows.Close()
 
 	pw, err := chromeSafeStoragePassword("Chrome")
 	if err != nil {
 		return "", err
 	}
 	key := deriveChromeAESKey(pw)
-	pt, err := decryptChromeCookieV10(enc, key)
-	if err != nil {
-		return "", fmt.Errorf("decrypt 'd' cookie (Chrome v20 not yet supported; downgrade or paste manually): %w", err)
+
+	var candidates int
+	var lastErr error
+	for rows.Next() {
+		var host string
+		var enc []byte
+		if err := rows.Scan(&host, &enc); err != nil {
+			lastErr = err
+			continue
+		}
+		candidates++
+		pt, err := decryptChromeCookie(enc, key)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		s := strings.TrimSpace(string(pt))
+		if strings.HasPrefix(s, "xoxd-") {
+			return s, nil
+		}
 	}
-	s := strings.TrimSpace(string(pt))
-	if !strings.HasPrefix(s, "xoxd-") {
-		return "", fmt.Errorf("decrypted cookie does not look like xoxd (len=%d)", len(s))
+	if candidates == 0 {
+		return "", errors.New("no 'd' cookie for *.slack.com in Chrome DB (sign into Slack in Chrome first)")
 	}
-	return s, nil
+	if lastErr != nil {
+		return "", fmt.Errorf("decrypt 'd' cookie failed (%d candidates tried, likely v20 App-Bound encryption — paste manually): %w", candidates, lastErr)
+	}
+	return "", fmt.Errorf("found %d 'd' cookie(s) but none decrypted to xoxd-* (likely v20 App-Bound encryption; paste manually)", candidates)
+}
+
+// decryptChromeCookie dispatches based on the version prefix. Returns a
+// helpful error for v20 since that scheme is App-Bound and requires more than
+// the standard "Chrome Safe Storage" Keychain key on macOS.
+func decryptChromeCookie(enc, key []byte) ([]byte, error) {
+	if len(enc) < 3 {
+		return nil, errors.New("encrypted value too short")
+	}
+	prefix := string(enc[:3])
+	switch prefix {
+	case "v10":
+		return decryptChromeCookieV10(enc, key)
+	case "v20":
+		return nil, errors.New("v20 App-Bound cookie (Chrome 127+) — not yet supported on macOS")
+	}
+	return nil, fmt.Errorf("unknown cookie version prefix %q", prefix)
 }
 
 // ScanSlackTeamsFromChrome returns the set of workspace subdomains the user

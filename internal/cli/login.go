@@ -26,8 +26,8 @@ func runLogin() error {
 		got, err := auth.ExtractXOXDFromChrome()
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "  Chrome extraction failed:", err)
-			fmt.Fprintln(os.Stderr, "  Falling back to manual paste.")
-			xoxd = promptLine("  Paste xoxd cookie (begins with xoxd-): ")
+			fmt.Fprintln(os.Stderr, "\n  Open Chrome → DevTools (⌥⌘I) → Application → Cookies → https://app.slack.com → 'd' → copy the Value")
+			xoxd = promptXOXD()
 		} else {
 			xoxd = got
 			fmt.Fprintln(os.Stderr, "  ✓ Got xoxd")
@@ -104,4 +104,20 @@ func promptLine(prompt string) string {
 	r := bufio.NewReader(os.Stdin)
 	s, _ := r.ReadString('\n')
 	return strings.TrimSpace(s)
+}
+
+// promptXOXD prompts the user for the xoxd cookie value, retrying until it
+// looks well-formed (or the user gives up with empty input).
+func promptXOXD() string {
+	for i := 0; i < 3; i++ {
+		v := promptLine("  Paste xoxd cookie (xoxd-...): ")
+		if v == "" {
+			return ""
+		}
+		if strings.HasPrefix(v, "xoxd-") {
+			return v
+		}
+		fmt.Fprintln(os.Stderr, "  That doesn't start with xoxd- — try again (Enter to abort).")
+	}
+	return ""
 }
