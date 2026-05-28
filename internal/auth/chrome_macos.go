@@ -189,9 +189,13 @@ func ExtractXOXDFromChrome() (string, error) {
 			lastErr = err
 			continue
 		}
-		s := strings.TrimSpace(string(pt))
-		if strings.HasPrefix(s, "xoxd-") {
-			return s, nil
+		// Chrome 118+ prepends 32 bytes of SHA-256(host_key) to v10 plaintext
+		// for cookie integrity. Try both with and without the prefix.
+		for _, cand := range candidatePlaintexts(pt) {
+			s := strings.TrimSpace(string(cand))
+			if strings.HasPrefix(s, "xoxd-") {
+				return s, nil
+			}
 		}
 	}
 	if candidates == 0 {
@@ -201,6 +205,16 @@ func ExtractXOXDFromChrome() (string, error) {
 		return "", fmt.Errorf("decrypt 'd' cookie failed (%d candidates tried, likely v20 App-Bound encryption — paste manually): %w", candidates, lastErr)
 	}
 	return "", fmt.Errorf("found %d 'd' cookie(s) but none decrypted to xoxd-* (likely v20 App-Bound encryption; paste manually)", candidates)
+}
+
+// candidatePlaintexts returns the raw decrypted bytes and, if it's long
+// enough, the slice after stripping the 32-byte SHA-256(host) prefix that
+// Chrome 118+ adds to v10 cookies for integrity protection.
+func candidatePlaintexts(pt []byte) [][]byte {
+	if len(pt) > 32 {
+		return [][]byte{pt[32:], pt}
+	}
+	return [][]byte{pt}
 }
 
 // decryptChromeCookie dispatches based on the version prefix. Returns a

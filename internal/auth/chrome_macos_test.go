@@ -70,3 +70,29 @@ func TestDecryptChromeCookieV10_NotV10(t *testing.T) {
 		t.Fatal("expected error for non-v10 cookie")
 	}
 }
+
+func TestCandidatePlaintexts_StripsHostHashPrefix(t *testing.T) {
+	// Chrome 118+ prepends 32-byte SHA-256(host) to plaintext.
+	hostPrefix := make([]byte, 32)
+	for i := range hostPrefix {
+		hostPrefix[i] = byte(i)
+	}
+	body := []byte("xoxd-real-token-payload")
+	full := append(append([]byte(nil), hostPrefix...), body...)
+
+	cands := candidatePlaintexts(full)
+	if len(cands) != 2 {
+		t.Fatalf("expected 2 candidates (stripped + full), got %d", len(cands))
+	}
+	if string(cands[0]) != string(body) {
+		t.Errorf("first candidate should be stripped body; got %q", cands[0])
+	}
+}
+
+func TestCandidatePlaintexts_ShortPlaintextNoStrip(t *testing.T) {
+	pt := []byte("xoxd-short")
+	cands := candidatePlaintexts(pt)
+	if len(cands) != 1 || string(cands[0]) != "xoxd-short" {
+		t.Fatalf("short plaintext should return single candidate: %v", cands)
+	}
+}
